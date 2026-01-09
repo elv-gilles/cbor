@@ -1206,6 +1206,9 @@ type DecMode interface {
 
 	// DecOptions returns user specified options used to create this DecMode.
 	DecOptions() DecOptions
+
+	// NewSearcher returns a new searcher that reads from r using dm DecMode.
+	NewSearcher(r io.Reader) (*Searcher, error)
 }
 
 type decMode struct {
