@@ -179,7 +179,7 @@ func TestSearch(t *testing.T) {
 			t.Errorf("case %d, %v", i, err)
 		} else {
 			var actual any
-			err = sea.dec.d.value(&actual)
+			err = sea.dec.Value(&actual)
 			if err != nil {
 				t.Errorf("case %d, %v", i, err)
 			}

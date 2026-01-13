@@ -21,7 +21,77 @@ import (
 // Search and SearchValue have both an optional callback function to convert a
 // struct key map into a string - to match search keys.
 type Searcher struct {
-	dec *Decoder
+	dec *ReadSeekDecoder
+}
+
+type ReadSeekDecoder struct {
+	opts DecOptions
+	dec  *Decoder
+}
+
+func (rsd *ReadSeekDecoder) DecOptions() DecOptions {
+	return rsd.opts
+}
+
+func (rsd *ReadSeekDecoder) ReadNext() (int, error) {
+	return rsd.dec.readNext()
+}
+
+func (rsd *ReadSeekDecoder) SkipReadNext() error {
+	err := rsd.dec.Skip()
+	if err != nil {
+		return err
+	}
+	_, err = rsd.dec.readNext()
+	return err
+}
+
+func (rsd *ReadSeekDecoder) Reset() {
+	rsd.dec.d.reset(rsd.dec.buf[rsd.dec.off:])
+}
+
+func (rsd *ReadSeekDecoder) Offset() int {
+	return rsd.dec.d.off
+}
+
+func (rsd *ReadSeekDecoder) Seek(off int) {
+	rsd.dec.d.off = off
+}
+
+func (rsd *ReadSeekDecoder) NextCBORType() cborType {
+	return rsd.dec.d.nextCBORType()
+}
+
+func (rsd *ReadSeekDecoder) GetHead() (t cborType, ai byte, val uint64) {
+	return rsd.dec.d.getHead()
+}
+
+func (rsd *ReadSeekDecoder) GetHeadWithIndefiniteLengthFlag() (
+	t cborType,
+	ai byte,
+	val uint64,
+	indefiniteLength bool) {
+	return rsd.dec.d.getHeadWithIndefiniteLengthFlag()
+}
+
+func (rsd *ReadSeekDecoder) NumOfItemsUntilBreak() int {
+	return rsd.dec.d.numOfItemsUntilBreak()
+}
+
+func (rsd *ReadSeekDecoder) FoundBreak() bool {
+	return rsd.dec.d.foundBreak()
+}
+
+func (rsd *ReadSeekDecoder) Skip() {
+	rsd.dec.d.skip()
+}
+
+func (rsd *ReadSeekDecoder) Value(v any) error {
+	return rsd.dec.d.value(v)
+}
+
+func (rsd *ReadSeekDecoder) Parse(skipSelfDescribedTag bool) (any, error) {
+	return rsd.dec.d.parse(skipSelfDescribedTag)
 }
 
 // SearchInfo is returned by a call to Search
@@ -71,8 +141,11 @@ var (
 
 // NewSearcher returns a new searcher that reads from r using dm DecMode.
 func (dm *decMode) NewSearcher(r io.Reader) (*Searcher, error) {
-	dec := &Decoder{r: r, d: decoder{dm: dm}}
-	siz, err := dec.readNext()
+	dec := &ReadSeekDecoder{
+		opts: dm.DecOptions(),
+		dec:  &Decoder{r: r, d: decoder{dm: dm}},
+	}
+	siz, err := dec.ReadNext()
 	if err != nil {
 		return nil, err
 	}
@@ -83,37 +156,37 @@ func (dm *decMode) NewSearcher(r io.Reader) (*Searcher, error) {
 }
 
 func (sea *Searcher) skipSelfDescribedTag() {
-	for sea.dec.d.nextCBORType() == cborTypeTag {
-		off := sea.dec.d.off
-		_, _, tagNum := sea.dec.d.getHead()
+	for sea.dec.NextCBORType() == cborTypeTag {
+		off := sea.dec.Offset()
+		_, _, tagNum := sea.dec.GetHead()
 		if tagNum != tagNumSelfDescribedCBOR {
-			sea.dec.d.off = off
+			sea.dec.Seek(off)
 			break
 		}
 	}
 }
 
 func (sea *Searcher) arrayMapInfo(t cborType, keys []string, opt SearchOption, info SearchInfo) (SearchInfo, error) {
-	savedOff := sea.dec.d.off
+	savedOff := sea.dec.Offset()
 
 	switch t {
 	case cborTypeArray:
-		_, _, val, indefiniteLength := sea.dec.d.getHeadWithIndefiniteLengthFlag()
+		_, _, val, indefiniteLength := sea.dec.GetHeadWithIndefiniteLengthFlag()
 		hasSize := !indefiniteLength
 		count := int(val)
 		if !hasSize {
-			count = sea.dec.d.numOfItemsUntilBreak()
+			count = sea.dec.NumOfItemsUntilBreak()
 		}
 		info.Length = count
 	case cborTypeMap:
-		_, _, val, indefiniteLength := sea.dec.d.getHeadWithIndefiniteLengthFlag()
+		_, _, val, indefiniteLength := sea.dec.GetHeadWithIndefiniteLengthFlag()
 		hasSize := !indefiniteLength
 		count := int(val)
 
 		length := 0
 		var mapKeys []string
 	out:
-		for i := 0; (hasSize && i < count) || (!hasSize && !sea.dec.d.foundBreak()); i++ {
+		for i := 0; (hasSize && i < count) || (!hasSize && !sea.dec.FoundBreak()); i++ {
 			length++
 			switch {
 			case (i == 0 && opt.MapKeyFirst) || opt.MapKeyAll:
@@ -127,10 +200,10 @@ func (sea *Searcher) arrayMapInfo(t cborType, keys []string, opt SearchOption, i
 				}
 			default:
 				// skip CBOR map key.
-				sea.dec.d.skip()
+				sea.dec.Skip()
 			}
 			// skip CBOR map value.
-			sea.dec.d.skip()
+			sea.dec.Skip()
 		}
 		if opt.Length {
 			info.Length = length
@@ -138,18 +211,13 @@ func (sea *Searcher) arrayMapInfo(t cborType, keys []string, opt SearchOption, i
 		info.MapKeys = mapKeys
 	}
 
-	sea.dec.d.off = savedOff
+	sea.dec.Seek(savedOff)
 	return info, nil
 }
 
 // Skip invokes Skip on the underlying decoder.
 func (sea *Searcher) Skip() error {
-	err := sea.dec.Skip()
-	if err != nil {
-		return err
-	}
-	_, err = sea.dec.readNext()
-	return err
+	return sea.dec.SkipReadNext()
 }
 
 // SearchValue searches for the element pointed to by the given path (JSON
@@ -159,12 +227,12 @@ func (sea *Searcher) SearchValue(keys []string, v any, opts ...SearchOption) err
 	if err != nil {
 		return err
 	}
-	return sea.dec.d.value(v)
+	return sea.dec.Value(v)
 }
 
 // parseCborMapKey convert CBOR map key to string
 func (sea *Searcher) parseCborMapKey(keys []string, opt SearchOption) (string, error) {
-	k, err := sea.dec.d.parse(true)
+	k, err := sea.dec.Parse(true)
 	if err != nil {
 		return "", newSearchErrorf("error parsing map key: (%v)", err)
 	}
@@ -172,7 +240,7 @@ func (sea *Searcher) parseCborMapKey(keys []string, opt SearchOption) (string, e
 	rv := reflect.ValueOf(k)
 	if !isHashableValue(rv) {
 		var converted bool
-		if sea.dec.d.dm.mapKeyByteString == MapKeyByteStringAllowed {
+		if sea.dec.DecOptions().MapKeyByteString == MapKeyByteStringAllowed {
 			k, converted = convertByteSliceToByteString(k)
 		}
 		if !converted {
@@ -222,7 +290,7 @@ func (sea *Searcher) parseCborMapKey(keys []string, opt SearchOption) (string, e
 // by the given path (JSON pointer like) and its cbor type as a string or an error.
 func (sea *Searcher) Search(keys []string, opts ...SearchOption) (info SearchInfo, err error) {
 
-	sea.dec.d.reset(sea.dec.buf[sea.dec.off:])
+	sea.dec.Reset()
 
 	if keys == nil {
 		keys = []string{}
@@ -239,8 +307,8 @@ func (sea *Searcher) Search(keys []string, opts ...SearchOption) (info SearchInf
 	idx := 0
 
 	for {
-		offset := sea.dec.d.off
-		t := sea.dec.d.nextCBORType()
+		offset := sea.dec.Offset()
+		t := sea.dec.NextCBORType()
 
 		if idx > len(keys)-1 {
 			ret := SearchInfo{
@@ -248,10 +316,10 @@ func (sea *Searcher) Search(keys []string, opts ...SearchOption) (info SearchInf
 				CborType: t.String(),
 			}
 			if opt.Size {
-				sea.dec.d.skip()
-				endOffset := sea.dec.d.off
+				sea.dec.Skip()
+				endOffset := sea.dec.Offset()
 				ret.Size = endOffset - offset
-				sea.dec.d.off = offset
+				sea.dec.Seek(offset)
 			}
 			if opt.arrayMapOption(t) {
 				ret, err = sea.arrayMapInfo(t, keys, opt, ret)
@@ -264,8 +332,8 @@ func (sea *Searcher) Search(keys []string, opts ...SearchOption) (info SearchInf
 
 		switch t {
 		case cborTypeTag:
-			_, _, tagNum := sea.dec.d.getHead()
-			contentOff := sea.dec.d.off
+			_, _, tagNum := sea.dec.GetHead()
+			contentOff := sea.dec.Offset()
 
 			switch tagNum {
 			case tagNumRFC3339Time, tagNumEpochTime, tagNumUnsignedBignum, tagNumNegativeBignum,
@@ -274,7 +342,7 @@ func (sea *Searcher) Search(keys []string, opts ...SearchOption) (info SearchInf
 				return noInfo, newSearchErrorf("not found, path: %s", keys[:idx+1])
 			default:
 				// parse tag content
-				sea.dec.d.off = contentOff
+				sea.dec.Seek(contentOff)
 				continue
 			}
 
@@ -285,11 +353,11 @@ func (sea *Searcher) Search(keys []string, opts ...SearchOption) (info SearchInf
 			}
 			aidx := int(i)
 
-			_, _, val, indefiniteLength := sea.dec.d.getHeadWithIndefiniteLengthFlag()
+			_, _, val, indefiniteLength := sea.dec.GetHeadWithIndefiniteLengthFlag()
 			hasSize := !indefiniteLength
 			count := int(val)
 			if !hasSize {
-				count = sea.dec.d.numOfItemsUntilBreak()
+				count = sea.dec.NumOfItemsUntilBreak()
 			}
 
 			if aidx < 0 {
@@ -304,17 +372,17 @@ func (sea *Searcher) Search(keys []string, opts ...SearchOption) (info SearchInf
 			for i := 0; i <= aidx; i++ {
 				sea.skipSelfDescribedTag()
 				if i < aidx {
-					sea.dec.d.skip()
+					sea.dec.Skip()
 				}
 			}
 
 		case cborTypeMap:
-			_, _, val, indefiniteLength := sea.dec.d.getHeadWithIndefiniteLengthFlag()
+			_, _, val, indefiniteLength := sea.dec.GetHeadWithIndefiniteLengthFlag()
 			hasSize := !indefiniteLength
 			count := int(val)
 
 			found := false
-			for i := 0; (hasSize && i < count) || (!hasSize && !sea.dec.d.foundBreak()); i++ {
+			for i := 0; (hasSize && i < count) || (!hasSize && !sea.dec.FoundBreak()); i++ {
 				key, err := sea.parseCborMapKey(keys[:idx+1], opt)
 				if err != nil {
 					return noInfo, newSearchErrorf("Error at path: %s (%v)", keys[:idx+1], err.Error())
@@ -324,7 +392,7 @@ func (sea *Searcher) Search(keys []string, opts ...SearchOption) (info SearchInf
 					break
 				}
 				// skip CBOR map value.
-				sea.dec.d.skip()
+				sea.dec.Skip()
 			}
 
 			if !found {
