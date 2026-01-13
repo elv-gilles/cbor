@@ -218,6 +218,55 @@ func TestSearch(t *testing.T) {
 
 }
 
+func TestSearchSize(t *testing.T) {
+
+	ctx := newSearchTestContext(t)
+	_, mbytes := ctx.mapBytes(searchMap())
+
+	searchReplace := func(path []string, want string, newVal string) {
+		sea, err := ctx.dec.NewSearcher(bytes.NewReader(mbytes))
+		if err != nil {
+			t.Errorf("unexpected %v", err)
+		}
+
+		info, err := sea.Search(path, SearchOption{Size: true})
+		if err != nil {
+			t.Fatalf("path: %v, unexpected error: %v", path, err)
+		}
+		if info.Size <= 0 {
+			t.Fatalf("path: %v, expected size > 0, got: %v", path, info.Size)
+		}
+		if info.Offset+info.Size > len(mbytes) {
+			t.Fatalf("path: %v, invalid offset & size, got offset %v, size: %v", path, info.Offset, info.Size)
+		}
+
+		dec := ctx.dec.NewDecoder(bytes.NewReader(mbytes[info.Offset:]))
+		var actual any
+		err = dec.Decode(&actual)
+		if want != actual {
+			t.Fatalf("path: %v, expected: %v, got: %v", path, want, actual)
+		}
+
+		if newVal == "" {
+			return
+		}
+
+		bb, err := ctx.enc.Marshal(newVal)
+		if err != nil {
+			t.Fatalf("path: %v, unexpected error: %v", path, err)
+		}
+		var newBytes []byte
+		newBytes = append(append(append(newBytes, mbytes[0:info.Offset]...), bb...), mbytes[info.Offset+info.Size:]...)
+		mbytes = newBytes
+	}
+
+	searchReplace([]string{"cats", "1"}, "miaow", "grr")
+	searchReplace([]string{"cats", "0"}, "puppy", "polymoo")
+	searchReplace([]string{"animals", "cat"}, "puppy", "popey")
+	searchReplace([]string{"animals", "dog"}, "bobby", "brutus")
+	searchReplace([]string{"animals", "dog"}, "brutus", "")
+}
+
 func TestSearchTaggedStructPrefixedWithSelfDescribed(t *testing.T) {
 	ctx := newSearchTestContext(t)
 

@@ -27,6 +27,7 @@ type Searcher struct {
 // SearchInfo is returned by a call to Search
 type SearchInfo struct {
 	Offset   int      // offset in cbor bytes at which the cbor element is found
+	Size     int      // count of cbor data bytes for the found element
 	CborType string   // cbor type (as a string) of the retrieved element
 	Length   int      // when Length option is true: count of items if the element is an array or a map
 	MapKeys  []string // when MapKeyFirst or MapKeyAll option is true: map key(s) if the element is a map
@@ -46,13 +47,14 @@ type KeyStructStringerFn func(keys []string, k any) (string, bool)
 
 // SearchOption defines optional values for a search.
 type SearchOption struct {
+	Size              bool                // true to retrieve the count of cbor bytes of the retrieved element
 	Length            bool                // true to retrieve the count of elements when the element is an array of a map
 	MapKeyFirst       bool                // true to retrieve the first map key (if the retrieved element is a map)
 	MapKeyAll         bool                // true to retrieve all map keys (if the retrieved element is a map)
 	KeyStructStringer KeyStructStringerFn // function to convert a struct key map to a string
 }
 
-func (o SearchOption) hasOption(t cborType) bool {
+func (o SearchOption) arrayMapOption(t cborType) bool {
 	switch t {
 	case cborTypeArray:
 		return o.Length
@@ -91,7 +93,7 @@ func (sea *Searcher) skipSelfDescribedTag() {
 	}
 }
 
-func (sea *Searcher) fillOptions(t cborType, keys []string, opt SearchOption, info SearchInfo) (SearchInfo, error) {
+func (sea *Searcher) arrayMapInfo(t cborType, keys []string, opt SearchOption, info SearchInfo) (SearchInfo, error) {
 	savedOff := sea.dec.d.off
 
 	switch t {
@@ -245,8 +247,14 @@ func (sea *Searcher) Search(keys []string, opts ...SearchOption) (info SearchInf
 				Offset:   offset,
 				CborType: t.String(),
 			}
-			if opt.hasOption(t) {
-				ret, err = sea.fillOptions(t, keys, opt, ret)
+			if opt.Size {
+				sea.dec.d.skip()
+				endOffset := sea.dec.d.off
+				ret.Size = endOffset - offset
+				sea.dec.d.off = offset
+			}
+			if opt.arrayMapOption(t) {
+				ret, err = sea.arrayMapInfo(t, keys, opt, ret)
 				if err != nil {
 					return noInfo, err
 				}
