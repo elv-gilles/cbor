@@ -113,6 +113,7 @@ const (
 	tagNumExpectedLaterEncodingBase64URL = 21
 	tagNumExpectedLaterEncodingBase64    = 22
 	tagNumExpectedLaterEncodingBase16    = 23
+	tagNumJsonNumber                     = 284
 	tagNumSelfDescribedCBOR              = 55799
 )
 
@@ -177,6 +178,17 @@ func validBuiltinTag(tagNum uint64, contentHead byte) error {
 		//   item, except for those contained in a nested data item tagged with an expected
 		//   conversion.
 		return nil
+
+	case tagNumJsonNumber:
+		// Tag content must be string type.
+		if t != cborTypeTextString && t != cborTypeByteString {
+			return newInadmissibleTagContentTypeError(
+				tagNumJsonNumber,
+				"text or byte string",
+				t.String())
+		}
+		return nil
+
 	}
 
 	return nil

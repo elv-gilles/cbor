@@ -14,6 +14,7 @@ import (
 	"math"
 	"math/big"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -5511,6 +5512,7 @@ func TestDecOptions(t *testing.T) {
 		BinaryUnmarshaler:         BinaryUnmarshalerNone,
 		TextUnmarshaler:           TextUnmarshalerTextString,
 		JSONUnmarshalerTranscoder: stubTranscoder{},
+		FloatToInt:                FloatToIntLenient,
 	}
 	ov := reflect.ValueOf(opts1)
 	for i := 0; i < ov.NumField(); i++ {
@@ -10908,5 +10910,317 @@ func TestJSONUnmarshalerTranscoder(t *testing.T) {
 			}
 
 		})
+	}
+}
+
+func TestIntRoundtripJsonCbor(t *testing.T) {
+
+	type structInt struct {
+		I int64  `json:"i"`
+		U uint64 `json:"u"`
+	}
+	// structIntAsFloat has the same structure as structInt and is used to test errors
+	type structIntAsFloat struct {
+		I float64 `json:"i"`
+		U float64 `json:"u"`
+	}
+
+	type testCase struct {
+		name    string
+		in      *structInt
+		inAs    *structIntAsFloat
+		lenient bool
+		want    any
+		wantErr bool
+	}
+	enc := defaultEncMode
+
+	_, err := DecOptions{FloatToInt: 48}.decMode()
+	if err == nil {
+		t.Fatalf("expected error (invalid FloatToInt), got nil")
+	}
+
+	for _, tc := range []*testCase{
+		{name: "regular", in: &structInt{I: 123, U: 456}, want: &structInt{I: 123, U: 456}},
+		{name: "regular-float", inAs: &structIntAsFloat{I: 123, U: 456}, want: &structInt{I: 123, U: 456}},
+		{name: "nan-int64", inAs: &structIntAsFloat{I: math.NaN(), U: 456}, wantErr: true},
+		{name: "nan-uint64", inAs: &structIntAsFloat{I: 123, U: math.NaN()}, wantErr: true},
+		{name: "inf-int64", inAs: &structIntAsFloat{I: math.Inf(1), U: 456}, wantErr: true},
+		{name: "inf-uint64", inAs: &structIntAsFloat{I: 123, U: math.Inf(-1)}, wantErr: true},
+		{name: "max-err", in: &structInt{I: math.MaxInt64, U: math.MaxUint64},
+			wantErr: true, // big.Float.Int64() returns accuracy 'below'
+		},
+		{name: "max", in: &structInt{I: math.MaxInt64, U: math.MaxUint64},
+			lenient: true,
+			want: &structInt{
+				I: 9223372036854775807,
+				U: 18446744073709551615,
+			}},
+	} {
+		var cborBytes []byte
+		var err error
+		dec, _ := DecOptions{FloatToInt: FloatToIntExact}.decMode()
+		if tc.lenient {
+			dec, _ = DecOptions{FloatToInt: FloatToIntLenient}.decMode()
+		}
+
+		if tc.in != nil {
+			var bb []byte
+			bb, err = json.Marshal(tc.in)
+			if err != nil {
+				t.Errorf("%s: json marshal returned non-nil error %v", tc.name, err)
+				continue
+			}
+			var gen any
+			err = json.Unmarshal(bb, &gen)
+			if err != nil {
+				t.Errorf("%s: json unmarshal returned non-nil error %v", tc.name, err)
+				continue
+			}
+			cborBytes, err = enc.Marshal(&gen)
+		} else {
+			cborBytes, err = enc.Marshal(tc.inAs)
+		}
+		if err != nil {
+			t.Errorf("%s: marshal returned non-nil error %v", tc.name, err)
+			continue
+		}
+
+		target := &structInt{}
+		err = dec.Unmarshal(cborBytes, target)
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("%s: expected error, got nil", tc.name)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%s: unmarshal returned non-nil error %v", tc.name, err)
+			continue
+		}
+		if !reflect.DeepEqual(tc.want, target) {
+			t.Errorf("expected: %v, got: %v", tc.want, target)
+		}
+	}
+
+}
+
+func TestJsonNumber(t *testing.T) {
+
+	type serial struct {
+		Ts  int64  `json:"ts"`
+		Uts uint64 `json:"uts"`
+	}
+
+	// Register tag CBOR JSON NUMBER 284
+	tags := NewTagSet()
+	if err := tags.Add(TagOptions{EncTag: EncTagRequired, DecTag: DecTagRequired},
+		reflect.TypeOf(json.Number("")), tagNumJsonNumber); err != nil {
+		t.Fatal("TagSet.Add:", err)
+	}
+	// Create Enc/DecMode with tags
+	dm, _ := DecOptions{}.DecModeWithTags(tags)
+	emTextString, _ := EncOptions{}.EncModeWithTags(tags)
+	emByteString, _ := EncOptions{String: StringToByteString}.EncModeWithTags(tags)
+
+	//2026-01-14 20:28:51.241044 +0000 UTC
+	now := int64(1768422531)
+	snow := "1768422531"
+	maxInt64 := int64(math.MaxInt64)
+	smaxInt64 := strconv.FormatInt(maxInt64, 10)
+	maxUint64 := uint64(math.MaxUint64)
+	smaxUint64 := strconv.FormatUint(maxUint64, 10)
+
+	encodeWithText := func(m map[string]interface{}) []byte {
+		ret, err := emTextString.Marshal(m)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		return ret
+	}
+
+	// special encoding func that makes map keys with 'text' string and values with 'byte' string
+	encodeWithByte := func(m map[string]interface{}) []byte {
+		e := bytes.NewBuffer(make([]byte, 0, 100))
+		encodeHead(e, byte(cborTypeMap), uint64(2))
+		err := encodeString(e, emTextString.(*encMode), reflect.ValueOf("ts"))
+		if err != nil {
+			t.Fatalf("encodeString: %v", err)
+		}
+		err = encodeString(e, emByteString.(*encMode), reflect.ValueOf(m["ts"]))
+		if err != nil {
+			t.Fatalf("encodeString: %v", err)
+		}
+		err = encodeString(e, emTextString.(*encMode), reflect.ValueOf("uts"))
+		if err != nil {
+			t.Fatalf("encodeString: %v", err)
+		}
+		err = encodeString(e, emByteString.(*encMode), reflect.ValueOf(m["uts"]))
+		if err != nil {
+			t.Fatalf("encodeString: %v", err)
+		}
+		return e.Bytes()
+	}
+
+	type testCase struct {
+		// in is a map as produced by serializing to json, then decoding from
+		// json with the decoder configured with UseNumber
+		in      map[string]interface{}
+		name    string
+		em      func(m map[string]interface{}) []byte
+		wantErr bool
+		want    any
+	}
+	for _, tc := range []*testCase{
+		{name: "regular-text",
+			in:   map[string]interface{}{"ts": json.Number(snow), "uts": json.Number(snow)},
+			em:   encodeWithText,
+			want: &serial{Ts: now, Uts: uint64(now)}},
+		{name: "regular-byte",
+			in:   map[string]interface{}{"ts": json.Number(snow), "uts": json.Number(snow)},
+			em:   encodeWithByte,
+			want: &serial{Ts: now, Uts: uint64(now)}},
+		{name: "error-text",
+			in:      map[string]interface{}{"ts": json.Number("snow"), "uts": json.Number("snow")},
+			em:      encodeWithText,
+			wantErr: true},
+		{name: "error-byte",
+			in:      map[string]interface{}{"ts": json.Number("snow"), "uts": json.Number("snow")},
+			em:      encodeWithByte,
+			wantErr: true},
+		{name: "max-text",
+			in:   map[string]interface{}{"ts": json.Number(smaxInt64), "uts": json.Number(smaxUint64)},
+			em:   encodeWithText,
+			want: &serial{Ts: maxInt64, Uts: maxUint64}},
+		{name: "max-byte",
+			in:   map[string]interface{}{"ts": json.Number(smaxInt64), "uts": json.Number(smaxUint64)},
+			em:   encodeWithByte,
+			want: &serial{Ts: maxInt64, Uts: maxUint64}},
+	} {
+
+		cborBytes := tc.em(tc.in)
+		//{
+		//	diag, err := Diagnose(cborBytes)
+		//	if err != nil {
+		//		t.Fatalf("%s: unexpected error %v", tc.name, err)
+		//	}
+		//	fmt.Println(diag)
+		//}
+		dec := dm.NewDecoder(bytes.NewReader(cborBytes))
+
+		ts := &serial{}
+		err := dec.Decode(ts)
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("%s: expected error, got nil", tc.name)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%s: unexpected error %v", tc.name, err)
+			continue
+		}
+		if !reflect.DeepEqual(tc.want, ts) {
+			t.Errorf("%s: expected: %v, got: %v", tc.name, tc.want, ts)
+		}
+	}
+}
+
+func TestJsonNumberFloat(t *testing.T) {
+
+	type serial struct {
+		Ts float64 `json:"ts"`
+	}
+
+	// Register tag CBOR JSON NUMBER 284
+	tags := NewTagSet()
+	if err := tags.Add(TagOptions{EncTag: EncTagRequired, DecTag: DecTagRequired},
+		reflect.TypeOf(json.Number("")), tagNumJsonNumber); err != nil {
+		t.Fatal("TagSet.Add:", err)
+	}
+	// Create Enc/DecMode with tags
+	dm, _ := DecOptions{}.DecModeWithTags(tags)
+	emTextString, _ := EncOptions{}.EncModeWithTags(tags)
+	emByteString, _ := EncOptions{String: StringToByteString}.EncModeWithTags(tags)
+
+	now := 1768422.531
+	snow := "1768422.531"
+
+	encodeWithText := func(m map[string]interface{}) []byte {
+		ret, err := emTextString.Marshal(m)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		return ret
+	}
+
+	// special encoding func that makes map keys with 'text' string and values with 'byte' string
+	encodeWithByte := func(m map[string]interface{}) []byte {
+		e := bytes.NewBuffer(make([]byte, 0, 100))
+		encodeHead(e, byte(cborTypeMap), uint64(1))
+		err := encodeString(e, emTextString.(*encMode), reflect.ValueOf("ts"))
+		if err != nil {
+			t.Fatalf("encodeString: %v", err)
+		}
+		err = encodeString(e, emByteString.(*encMode), reflect.ValueOf(m["ts"]))
+		if err != nil {
+			t.Fatalf("encodeString: %v", err)
+		}
+		return e.Bytes()
+	}
+
+	type testCase struct {
+		// in is a map as produced by serializing to json, then decoding from
+		// json with the decoder configured with UseNumber
+		in      map[string]interface{}
+		name    string
+		em      func(m map[string]interface{}) []byte
+		wantErr bool
+		want    any
+	}
+	for _, tc := range []*testCase{
+		{name: "regular-text",
+			in:   map[string]interface{}{"ts": json.Number(snow)},
+			em:   encodeWithText,
+			want: &serial{Ts: now}},
+		{name: "regular-byte",
+			in:   map[string]interface{}{"ts": json.Number(snow)},
+			em:   encodeWithByte,
+			want: &serial{Ts: now}},
+		{name: "error-text",
+			in:      map[string]interface{}{"ts": json.Number("snow")},
+			em:      encodeWithText,
+			wantErr: true},
+		{name: "error-byte",
+			in:      map[string]interface{}{"ts": json.Number("snow")},
+			em:      encodeWithByte,
+			wantErr: true},
+	} {
+
+		cborBytes := tc.em(tc.in)
+		//{
+		//	diag, err := Diagnose(cborBytes)
+		//	if err != nil {
+		//		t.Fatalf("%s: unexpected error %v", tc.name, err)
+		//	}
+		//	fmt.Println(diag)
+		//}
+		dec := dm.NewDecoder(bytes.NewReader(cborBytes))
+
+		ts := &serial{}
+		err := dec.Decode(ts)
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("%s: expected error, got nil", tc.name)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%s: unexpected error %v", tc.name, err)
+			continue
+		}
+		if !reflect.DeepEqual(tc.want, ts) {
+			t.Errorf("%s: expected: %v, got: %v", tc.name, tc.want, ts)
+		}
 	}
 }
